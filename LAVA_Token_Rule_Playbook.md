@@ -46,7 +46,7 @@ The 50M LAVA tokens are distributed as follows:
 | Stakeholder           | Allocation | Percentage | Vesting Details                                       |
 | --------------------- | ---------- | ---------- | ----------------------------------------------------- |
 | **Community Rewards** | 20M        | 40%        | No TGE, 5% monthly over 20 months                     |
-| **Public Sale**       | 10M        | 20%        | 30% at TGE, 35% weekly for 2 weeks                    |
+| **Public Sale**       | 10M        | 20%        | 100% immediately available (no vesting)                    |
 | **CEX Listing**       | 5M         | 10%        | No TGE, 25% quarterly over 4 quarters                 |
 | **Advisors**          | 4M         | 8%         | 25% at TGE, 25% weekly for 3 weeks                    |
 | **Team**              | 3.5M       | 7%         | No TGE, 3-month cliff, then 10% monthly for 10 months |
@@ -63,8 +63,8 @@ The 50M LAVA tokens are distributed as follows:
 
 ### Key Vesting Timeline
 
-- **Week 0 (TGE):** Private Sale (25%), Public Sale (30%), Advisors (25%) receive initial releases
-- **Weeks 1-3:** Private Sale, Public Sale, Advisors continue weekly releases
+- **Week 0 (TGE):** Private Sale (25%), Public Sale (100%), Advisors (25%) receive initial releases
+- **Weeks 1-3:** Private Sale, Advisors continue weekly releases
 - **Month 1-12:** Community Rewards receive monthly releases
 - **Quarters 1-4:** CEX Listing receives quarterly releases
 - **Month 4-14:** Team receives monthly releases (after 3-month cliff)
@@ -72,21 +72,6 @@ The 50M LAVA tokens are distributed as follows:
 ## Fee handling & transparency
 
 - Fees collected by the contract are distributed in the designated wallets.
-
----
-
-## Recommended operational checklist (team)
-
-1. Deploy contract with proper constructor arguments; verify the source on Basescan.
-2. **Set all vesting wallet addresses** using `setVestingWallets()` function.
-3. Provide liquidity to the selected AMM pair (6% of supply is immediately available).
-4. Set the AMM pair address using `setAutomatedMarketMakerPair()`.
-5. Optionally adjust fee split via `setFeeShares()` (total rates remain fixed).
-6. Enable trading via `enableTrading()` once liquidity is secured and pair is set.
-7. **Begin vesting releases:** Set up processes to release vested tokens according to schedules.
-8. Lock LP tokens via a trusted service and publish the lock details.
-9. **Publish vesting wallet addresses** and release schedules for transparency.
-10. Complete an external security audit and publish the report.
 
 ---
 
