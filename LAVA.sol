@@ -1,64 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
-/**
- * LAVA Token (Base) - ERC20
- *
- * Finalized contract per owner specifications:
- * - Fixed total supply: 250,000,000 LAVA (immutable, no mint).
- * - No burn function.
- * - Trading tax: 2.5% buy / 2.5% sell for the first 90 days after trading enabled;
- *   permanently drops to 1.0% buy / 1.0% sell after 90 days.
- *   >> Fees are hardcoded and cannot be changed by the owner.
- * - No transfer tax (peer-to-peer transfers are fee-free).
- * - Owner remains (for IDO admin tasks). No forced renounce by contract.
- * - Liquidity locking is off-chain (handled by the team / launchpad).
- * - No blacklist.
- * - No emergency pause.
- * - Temporary anti-snipe limit: for the first 1 minute after trading is enabled,
- *   max buy or sell per transaction = 0.5% of total supply. After 1 minute, limits clear.
- * - Minimal admin surface: owner can set AMM pairs, router, fee-share wallets, swap thresholds, and enable trading.
- *
- * Security notes & rationale:
- * - Fee schedule and limit windows are enforced by block timestamps and constants in-code.
- * - SwapBack uses a reentrancy guard (lockTheSwap modifier).
- * - The contract avoids owner-controlled mutable fee rates to reduce rug risk.
- * - Owner retains minimal controls needed for an IDO workflow (pair setting, router, wallets).
- *
- * Auditor checklist (quick):
- * - Confirm router address and pair addresses before deployment.
- * - Confirm marketing & buyback wallets set correctly post-deploy.
- * - Test trading enable flow, 1-minute limit, and 90-day fee reduction behavior on a testnet fork.
- *
- * DISCLAIMER: Please audit before mainnet deployment.
- */
-
-interface IUniswapV2Router {
-    function factory() external pure returns (address);
-    function WETH() external pure returns (address);
-    function swapExactTokensForETHSupportingFeeOnTransferTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external;
-    function addLiquidityETH(
-        address token,
-        uint256 amountTokenDesired,
-        uint256 amountTokenMin,
-        uint256 amountETHMin,
-        address to,
-        uint256 deadline
-    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
-}
-
-interface IUniswapV2Pair {
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-}
-
 abstract contract Context {
     function _msgSender() internal view virtual returns (address) {
         return msg.sender;
@@ -108,7 +50,7 @@ contract LAVA is Context, IERC20, Ownable {
     string private constant _symbol = "LAVA";
     uint8 private constant _decimals = 18;
 
-    uint256 private constant _totalSupply = 250_000_000 * 10**_decimals; // 250M
+    uint256 private constant _totalSupply = 50_000_000 * 10**_decimals; // 50M
 
     mapping(address => uint256) private _balances;
     mapping(address => mapping(address => uint256)) private _allowances;
@@ -119,7 +61,6 @@ contract LAVA is Context, IERC20, Ownable {
 
     // --- AMM pairs detection ---
     mapping(address => bool) public automatedMarketMakerPairs;
-    address public routerAddress;
 
     // --- Fee timing & immutable fee values ---
     uint16 private constant FEE_DENOMINATOR = 10000;
@@ -127,42 +68,29 @@ contract LAVA is Context, IERC20, Ownable {
     uint16 private constant INITIAL_FEE_BPS = 250; // 2.5% during first 90 days
     uint16 private constant POST_FEE_BPS = 100; // 1.0% after 90 days
 
-    // Fee split (in bps of the fee amount) configurable by owner to route funds
-    uint16 public liquidityShareBps = 3000; // 30% of fee
-    uint16 public marketingShareBps = 5000; // 50% of fee
-    uint16 public buybackShareBps = 2000; // 20% of fee
+    // Treasury wallet for fee collection
+    address public treasuryWallet;
+    uint256 public feeTransferThreshold; // Threshold for transferring fees to treasury
+    uint256 public collectedFees; // Track fees collected in contract
 
-    address public marketingWallet;
-    address public buybackWallet;
-
-    // Collected fee tokens stored in contract
-    uint256 public tokensForLiquidity;
-    uint256 public tokensForMarketing;
-    uint256 public tokensForBuyback;
-
-    uint public constant privateSaleShare = 600; // 6%
+    uint public constant privateSaleShare = 900; // 9%
     uint public constant publicSaleShare = 2000; // 20%
-    uint public constant liquidityProvisionShare = 300; // 3%
-    uint public constant communityShare = 4600; // 46%
+    uint public constant liquidityProvisionShare = 600; // 6%
+    uint public constant communityShare = 4000; // 40%
     uint public constant cexListingShare = 1000; // 10%
     uint public constant advisorShare = 800; // 8%
     uint public constant teamShare = 700; // 7%
 
-    // Vesting wallet addresses
-    address public privateSaleWallet;
-    address public publicSaleWallet;
+    // Non-vesting wallets (tokens minted immediately at deployment)
     address public liquidityProvisionWallet;
-    address public communityRewardsWallet;
-    address public cexListingWallet;
-    address public advisorWallet;
-    address public teamWallet;
+    address public publicSaleWallet;
 
     // TGE and Vesting tracking
     uint256 public immutable tgeTimestamp; // Set at deployment (TGE)
     uint256 public constant WEEK_IN_SECONDS = 7 days;
 
     // Vesting categories
-    enum VestingCategory { PrivateSale, PublicSale, CommunityRewards, Advisors, CexListing, Team }
+    enum VestingCategory { PrivateSale, CommunityRewards, Advisors, CexListing, Team }
 
     // Vesting configuration struct
     struct VestingSchedule {
@@ -177,24 +105,26 @@ contract LAVA is Context, IERC20, Ownable {
     // Vesting schedules for each category
     mapping(VestingCategory => VestingSchedule) public vestingSchedules;
 
-    // Swap settings
-    bool private inSwap;
-    uint256 public swapTokensAtAmount = (_totalSupply * 5) / 10000; // 0.05% default
-    modifier lockTheSwap() {
-        inSwap = true;
-        _;
-        inSwap = false;
-    }
+    // Minting tracking
+    uint256 public totalMinted = 0;
+    mapping(VestingCategory => uint256) public mintedByCategory;
 
-    // Temporary max tx limits
+    // Fee transfer lock to prevent reentrancy
+    bool private inFeeTransfer;
+    modifier lockFeeTransfer() {
+        inFeeTransfer = true;
+        _;
+        inFeeTransfer = false;
+    }
     uint256 public constant TEMP_LIMIT_WINDOW = 1 minutes; // first 1 minute
     uint256 public constant TEMP_MAX_BPS = 50; // 0.5% = 50 bps
     bool public limitsInEffect = true; // enforced only during the TEMP_LIMIT_WINDOW
 
     event TradingEnabled(uint256 startTimestamp);
     event SetAutomatedMarketMakerPair(address indexed pair, bool indexed value);
-    event UpdateFeeShares(uint16 liq, uint16 mkt, uint16 buyback);
-    event SwapBack(uint256 tokensSwapped);
+    event TreasuryWalletUpdated(address indexed oldWallet, address indexed newWallet);
+    event FeeTransferThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
+    event FeesTransferredToTreasury(uint256 amount);
     event VestingWalletsUpdated(
         address privateSale,
         address publicSale, 
@@ -204,51 +134,42 @@ contract LAVA is Context, IERC20, Ownable {
         address advisor,
         address team
     );
-    event PrivateSaleTokensReleased(address indexed wallet, uint256 amount, uint256 totalReleased);
-    event PublicSaleTokensReleased(address indexed wallet, uint256 amount, uint256 totalReleased);
     event TokensReleased(VestingCategory indexed category, address indexed wallet, uint256 amount, uint256 totalReleased);
     event VestingScheduleUpdated(VestingCategory indexed category, uint256 totalShare, uint256 tgePercent, uint256 weeklyPercent, uint256 vestingWeeks);
 
     constructor(
-        address _routerAddress, 
-        address _marketingWallet, 
-        address _buybackWallet,
-        address _liquidityWallet
+        address _treasuryWallet,
+        address _liquidityWallet,
+        address _publicSaleWallet
     ) Ownable() {
-        require(_routerAddress != address(0), "router 0");
-        require(_marketingWallet != address(0), "marketing 0");
-        require(_buybackWallet != address(0), "buyback 0");
+        require(_treasuryWallet != address(0), "treasury 0");
         require(_liquidityWallet != address(0), "liquidity 0");
+        require(_publicSaleWallet != address(0), "public sale 0");
 
-        routerAddress = _routerAddress;
-        marketingWallet = _marketingWallet;
-        buybackWallet = _buybackWallet;
+        treasuryWallet = _treasuryWallet;
         liquidityProvisionWallet = _liquidityWallet;
+        publicSaleWallet = _publicSaleWallet;
         
-        // Set TGE timestamp at deployment
+        // Set default fee transfer threshold to 0.1% of total supply
+        feeTransferThreshold = (_totalSupply * 10) / 10000;
+
         tgeTimestamp = block.timestamp;
 
-        // Initialize vesting schedules
         _initializeVestingSchedules();
 
-        // Calculate liquidity allocation (3% of total supply)
         uint256 liquidityAmount = (_totalSupply * liquidityProvisionShare) / FEE_DENOMINATOR;
         
-        // Transfer liquidity tokens directly to liquidity wallet (no vesting)
-        _balances[_liquidityWallet] = liquidityAmount;
-        emit Transfer(address(0), _liquidityWallet, liquidityAmount);
+        uint256 publicSaleAmount = (_totalSupply * publicSaleShare) / FEE_DENOMINATOR;
         
-        // Remaining tokens go to deployer for vesting distribution
-        uint256 remainingTokens = _totalSupply - liquidityAmount;
-        _balances[_msgSender()] = remainingTokens;
-        emit Transfer(address(0), _msgSender(), remainingTokens);
+        _mint(_liquidityWallet, liquidityAmount);
+        
+        _mint(_publicSaleWallet, publicSaleAmount);
     }
 
-    // --- ERC20 ---
     function name() public pure returns (string memory) { return _name; }
     function symbol() public pure returns (string memory) { return _symbol; }
     function decimals() public pure returns (uint8) { return _decimals; }
-    function totalSupply() public pure override returns (uint256) { return _totalSupply; }
+    function totalSupply() public view override returns (uint256) { return totalMinted; }
     function balanceOf(address account) public view override returns (uint256) { return _balances[account]; }
 
     function transfer(address recipient, uint256 amount) public override returns (bool) {
@@ -280,7 +201,21 @@ contract LAVA is Context, IERC20, Ownable {
         emit Approval(owner_, spender, amount);
     }
 
-    // --- Core transfer with fee logic ---
+    function _mint(address to, uint256 amount) internal {
+        require(to != address(0), "mint to zero address");
+        require(amount > 0, "mint zero amount");
+        
+        // Check total supply limit
+        require(totalMinted + amount <= _totalSupply, "Exceeds total supply");
+        
+        // Update total minted
+        totalMinted += amount;
+        
+        // Update balance and emit transfer
+        _balances[to] += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
     function _transfer(address from, address to, uint256 amount) internal {
         require(from != address(0) && to != address(0), "zero addr");
         require(_balances[from] >= amount, "insufficient balance");
@@ -299,37 +234,30 @@ contract LAVA is Context, IERC20, Ownable {
             }
         }
 
+        // Check if we should transfer collected fees to treasury
         uint256 contractTokenBalance = _balances[address(this)];
-        bool canSwap = contractTokenBalance >= swapTokensAtAmount;
-
-        if (canSwap && !inSwap && !automatedMarketMakerPairs[from] && from != address(this) && to != address(this)) {
-            _swapBack(contractTokenBalance);
+        if (contractTokenBalance >= feeTransferThreshold && !inFeeTransfer && from != address(this) && to != address(this)) {
+            _transferFeesToTreasury();
         }
 
         uint256 amountReceived = amount;
-        // apply fee only on trades (buy or sell)
         if ((automatedMarketMakerPairs[from] || automatedMarketMakerPairs[to]) && !_isFeeExcluded(from, to)) {
             uint16 feeBps = _currentFeeBps();
             uint256 feeAmount = (amount * feeBps) / FEE_DENOMINATOR;
             if (feeAmount > 0) {
                 amountReceived = amount - feeAmount;
                 _balances[address(this)] += feeAmount;
-                // allocate portions
-                tokensForLiquidity += (feeAmount * liquidityShareBps) / FEE_DENOMINATOR;
-                tokensForMarketing += (feeAmount * marketingShareBps) / FEE_DENOMINATOR;
-                tokensForBuyback += (feeAmount * buybackShareBps) / FEE_DENOMINATOR;
+                collectedFees += feeAmount;
                 emit Transfer(from, address(this), feeAmount);
             }
         }
 
-        // perform transfer
         _balances[from] -= amount;
         _balances[to] += amountReceived;
         emit Transfer(from, to, amountReceived);
     }
 
     function _isFeeExcluded(address from, address to) internal view returns (bool) {
-        // Owner and contract are excluded from fees
         if (from == owner() || to == owner() || from == address(this) || to == address(this)) return true;
         return false;
     }
@@ -340,60 +268,18 @@ contract LAVA is Context, IERC20, Ownable {
         return POST_FEE_BPS;
     }
 
-    // --- Swap & Liquify ---
-    function _swapBack(uint256 contractTokenBalance) internal lockTheSwap {
-        uint256 totalTokensToSwap = tokensForLiquidity + tokensForMarketing + tokensForBuyback;
-        if (totalTokensToSwap == 0 || contractTokenBalance == 0) { return; }
-
-        if (contractTokenBalance > totalTokensToSwap) contractTokenBalance = totalTokensToSwap;
-
-        uint256 liquidityTokens = (contractTokenBalance * tokensForLiquidity) / totalTokensToSwap / 2;
-        uint256 amountToSwapForETH = contractTokenBalance - liquidityTokens;
-
-        uint256 initialETHBalance = address(this).balance;
-
-        _approve(address(this), routerAddress, amountToSwapForETH);
-        address[] memory path = new address[](2);
-        path[0] = address(this);
-        path[1] = IUniswapV2Router(routerAddress).WETH();
-
-        IUniswapV2Router(routerAddress).swapExactTokensForETHSupportingFeeOnTransferTokens(
-            amountToSwapForETH,
-            0,
-            path,
-            address(this),
-            block.timestamp
-        );
-
-        uint256 ethReceived = address(this).balance - initialETHBalance;
-
-        uint256 ethForMarketing = (ethReceived * tokensForMarketing) / totalTokensToSwap;
-        uint256 ethForBuyback = (ethReceived * tokensForBuyback) / totalTokensToSwap;
-        uint256 ethForLiquidity = ethReceived - ethForMarketing - ethForBuyback;
-
-        tokensForLiquidity = 0;
-        tokensForMarketing = 0;
-        tokensForBuyback = 0;
-
-        if (liquidityTokens > 0 && ethForLiquidity > 0) {
-            _approve(address(this), routerAddress, liquidityTokens);
-            IUniswapV2Router(routerAddress).addLiquidityETH{value: ethForLiquidity}(
-                address(this),
-                liquidityTokens,
-                0,
-                0,
-                owner(),
-                block.timestamp
-            );
-        }
-
-        (bool successMarketing, ) = marketingWallet.call{value: ethForMarketing}("");
-        (bool successBuyback, ) = buybackWallet.call{value: ethForBuyback}("");
-
-        emit SwapBack(contractTokenBalance);
+    function _transferFeesToTreasury() internal lockFeeTransfer {
+        uint256 contractBalance = _balances[address(this)];
+        if (contractBalance == 0) return;
+        
+        _balances[address(this)] = 0;
+        _balances[treasuryWallet] += contractBalance;
+        collectedFees = 0;
+        
+        emit Transfer(address(this), treasuryWallet, contractBalance);
+        emit FeesTransferredToTreasury(contractBalance);
     }
 
-    // --- Admin ---
     receive() external payable {}
 
     function enableTrading() external onlyOwner {
@@ -409,29 +295,23 @@ contract LAVA is Context, IERC20, Ownable {
         emit SetAutomatedMarketMakerPair(pair, value);
     }
 
-    function setRouterAddress(address _router) external onlyOwner {
-        require(_router != address(0), "router 0");
-        routerAddress = _router;
+    function setTreasuryWallet(address _treasuryWallet) external onlyOwner {
+        require(_treasuryWallet != address(0), "treasury wallet cannot be zero");
+        address oldWallet = treasuryWallet;
+        treasuryWallet = _treasuryWallet;
+        emit TreasuryWalletUpdated(oldWallet, _treasuryWallet);
     }
 
-    function setFeeShares(uint16 _liqShareBps, uint16 _marketingShareBps, uint16 _buybackShareBps) external onlyOwner {
-        require(_liqShareBps + _marketingShareBps + _buybackShareBps == FEE_DENOMINATOR, "shares must sum to 10000");
-        liquidityShareBps = _liqShareBps;
-        marketingShareBps = _marketingShareBps;
-        buybackShareBps = _buybackShareBps;
-        emit UpdateFeeShares(_liqShareBps, _marketingShareBps, _buybackShareBps);
+    function setFeeTransferThreshold(uint256 _threshold) external onlyOwner {
+        require(_threshold > 0, "threshold must be greater than 0");
+        uint256 oldThreshold = feeTransferThreshold;
+        feeTransferThreshold = _threshold;
+        emit FeeTransferThresholdUpdated(oldThreshold, _threshold);
     }
 
-    function setWallets(address _marketing, address _buyback) external onlyOwner {
-        require(_marketing != address(0) && _buyback != address(0), "wallet 0");
-        marketingWallet = _marketing;
-        buybackWallet = _buyback;
-    }
-
-    // Set individual vesting wallets
     function setPrivateSaleWallet(address _wallet) external onlyOwner {
         require(_wallet != address(0), "wallet 0");
-        privateSaleWallet = _wallet;
+        vestingSchedules[VestingCategory.PrivateSale].wallet = _wallet;
     }
 
     function setPublicSaleWallet(address _wallet) external onlyOwner {
@@ -446,74 +326,35 @@ contract LAVA is Context, IERC20, Ownable {
 
     function setCommunityRewardsWallet(address _wallet) external onlyOwner {
         require(_wallet != address(0), "wallet 0");
-        communityRewardsWallet = _wallet;
+        vestingSchedules[VestingCategory.CommunityRewards].wallet = _wallet;
     }
 
     function setCexListingWallet(address _wallet) external onlyOwner {
         require(_wallet != address(0), "wallet 0");
-        cexListingWallet = _wallet;
+        vestingSchedules[VestingCategory.CexListing].wallet = _wallet;
     }
 
     function setAdvisorWallet(address _wallet) external onlyOwner {
         require(_wallet != address(0), "wallet 0");
-        advisorWallet = _wallet;
+        vestingSchedules[VestingCategory.Advisors].wallet = _wallet;
     }
 
     function setTeamWallet(address _wallet) external onlyOwner {
         require(_wallet != address(0), "wallet 0");
-        teamWallet = _wallet;
+        vestingSchedules[VestingCategory.Team].wallet = _wallet;
     }
 
-    // Set all vesting wallets at once
-    function setVestingWallets(
-        address _privateSale,
-        address _publicSale,
-        address _liquidityProvision,
-        address _communityRewards,
-        address _cexListing,
-        address _advisor,
-        address _team
-    ) external onlyOwner {
-        require(
-            _privateSale != address(0) &&
-            _publicSale != address(0) &&
-            _liquidityProvision != address(0) &&
-            _communityRewards != address(0) &&
-            _cexListing != address(0) &&
-            _advisor != address(0) &&
-            _team != address(0),
-            "wallet 0"
-        );
-        
-        privateSaleWallet = _privateSale;
-        publicSaleWallet = _publicSale;
-        liquidityProvisionWallet = _liquidityProvision;
-        communityRewardsWallet = _communityRewards;
-        cexListingWallet = _cexListing;
-        advisorWallet = _advisor;
-        teamWallet = _team;
-        
-        emit VestingWalletsUpdated(
-            _privateSale,
-            _publicSale,
-            _liquidityProvision,
-            _communityRewards,
-            _cexListing,
-            _advisor,
-            _team
-        );
-    }
+    
 
-    function setSwapSettings(uint256 _swapTokensAtAmount) external onlyOwner {
-        require(_swapTokensAtAmount > 0, "zero");
-        swapTokensAtAmount = _swapTokensAtAmount;
+    function manualTransferFeesToTreasury() external onlyOwner {
+        require(_balances[address(this)] > 0, "No fees to transfer");
+        _transferFeesToTreasury();
     }
 
     function disableTemporaryLimits() external onlyOwner {
         limitsInEffect = false;
     }
 
-    // emergency rescue (owner only) - minimal surface
     function rescueETH(address to) external onlyOwner {
         require(to != address(0), "zero addr");
         uint256 bal = address(this).balance;
@@ -529,13 +370,9 @@ contract LAVA is Context, IERC20, Ownable {
         emit RescueERC20(tokenAddress, to, amount);
     }
 
-    /**
-     * @dev Initialize vesting schedules for all categories
-     */
     function _initializeVestingSchedules() internal {
-        // Private Sale: 25% @ TGE, 25% weekly for 3 weeks
         vestingSchedules[VestingCategory.PrivateSale] = VestingSchedule({
-            totalShare: privateSaleShare,      // 600 (6%)
+            totalShare: privateSaleShare,      // 900 (9%)
             tgePercent: 2500,                  // 25%
             weeklyPercent: 2500,               // 25%
             vestingWeeks: 3,                   // 3 weeks
@@ -543,27 +380,15 @@ contract LAVA is Context, IERC20, Ownable {
             wallet: address(0)                 // Set later
         });
 
-        // Public Sale: 35% @ TGE, 32.5% weekly for 2 weeks
-        vestingSchedules[VestingCategory.PublicSale] = VestingSchedule({
-            totalShare: publicSaleShare,       // 2000 (20%)
-            tgePercent: 3500,                  // 35%
-            weeklyPercent: 3250,               // 32.5%
-            vestingWeeks: 2,                   // 2 weeks
-            released: 0,
-            wallet: address(0)                 // Set later
-        });
-
-        // Community Rewards: 2.5% monthly linear (12 months, no TGE)
         vestingSchedules[VestingCategory.CommunityRewards] = VestingSchedule({
-            totalShare: communityShare,        // 4600 (46%)
+            totalShare: communityShare,        // 4000 (40%)
             tgePercent: 0,                     // 0% at TGE
-            weeklyPercent: 575,                // 2.5% monthly = 575 bps weekly (2500/4.345)
-            vestingWeeks: 52,                  // 12 months = 52 weeks
+            weeklyPercent: 1150,                // 5% monthly = 1150 bps weekly (5000/4.345)
+            vestingWeeks: 86,                  // 20 months = 86 weeks
             released: 0,
             wallet: address(0)                 // Set later
         });
 
-        // Advisors: 25% @ TGE, 25% weekly linear (assuming same as private sale)
         vestingSchedules[VestingCategory.Advisors] = VestingSchedule({
             totalShare: advisorShare,          // 800 (8%)
             tgePercent: 2500,                  // 25%
@@ -573,7 +398,6 @@ contract LAVA is Context, IERC20, Ownable {
             wallet: address(0)                 // Set later
         });
 
-        // CEX Listing: 25% quarterly linear (assuming 4 quarters, no TGE)
         vestingSchedules[VestingCategory.CexListing] = VestingSchedule({
             totalShare: cexListingShare,       // 1000 (10%)
             tgePercent: 0,                     // 0% at TGE
@@ -583,22 +407,17 @@ contract LAVA is Context, IERC20, Ownable {
             wallet: address(0)                 // Set later
         });
 
-        // Team: 5 month cliff, 10% monthly linear (assuming 10 months after cliff)
         vestingSchedules[VestingCategory.Team] = VestingSchedule({
             totalShare: teamShare,             // 700 (7%)
             tgePercent: 0,                     // 0% at TGE
             weeklyPercent: 230,                // 10% monthly = ~230 bps weekly (1000/4.33)
-            vestingWeeks: 43,                  // 10 months = ~43 weeks (starts after 22 week cliff)
+            vestingWeeks: 56,                  // 10 months = ~56 weeks (starts after 13 week cliff)
             released: 0,
             wallet: address(0)                 // Set later
         });
     }
 
-    /**
-     * @dev Releases vested tokens for a specific category
-     * @param category The vesting category to release tokens for
-     * @return amount The amount of tokens released
-     */
+
     function releaseTokens(VestingCategory category) external returns (uint256 amount) {
         VestingSchedule storage schedule = vestingSchedules[category];
         require(schedule.wallet != address(0), "Wallet not set for category");
@@ -607,61 +426,66 @@ contract LAVA is Context, IERC20, Ownable {
         require(vestedAmount > schedule.released, "No tokens to release");
         
         amount = vestedAmount - schedule.released;
+        
+        uint256 totalCategoryTokens = (_totalSupply * schedule.totalShare) / FEE_DENOMINATOR;
+        require(mintedByCategory[category] + amount <= totalCategoryTokens, "Exceeds category allocation");
+        
         schedule.released = vestedAmount;
         
-        // Transfer tokens from contract deployer to category wallet
-        _transfer(owner(), schedule.wallet, amount);
+        _mint(schedule.wallet, amount);
+        
+        mintedByCategory[category] += amount;
         
         emit TokensReleased(category, schedule.wallet, amount, schedule.released);
         
         return amount;
     }
     
-    /**
-     * @dev Calculates how many tokens should be vested for a category by now
-     * @param category The vesting category to calculate for
-     * @return vestedAmount Total amount that should be vested
-     */
     function calculateVested(VestingCategory category) public view returns (uint256 vestedAmount) {
         VestingSchedule memory schedule = vestingSchedules[category];
         uint256 totalCategoryTokens = (_totalSupply * schedule.totalShare) / FEE_DENOMINATOR;
-        
-        // Handle team cliff (5 months = ~22 weeks)
+        uint256 remainingCategoryTokens = totalCategoryTokens - mintedByCategory[category];
         uint256 timeSinceTGE = block.timestamp - tgeTimestamp;
 
+        // Handle team cliff period - no accumulation during cliff
         if (category == VestingCategory.Team) {
-            uint256 cliffWeeks = 22; // 5 months cliff
+            uint256 cliffWeeks = 13; // 3 months cliff
             if (timeSinceTGE < cliffWeeks * WEEK_IN_SECONDS) {
-                return 0; // Still in cliff period - no tokens claimable yet
+                return 0; // Still in cliff period - no tokens accumulated yet
             }
-            // After cliff: calculate vesting for ALL weeks since TGE (including cliff period)
-        }
+            
+            // For team, calculate weeks passed since cliff ended, not since TGE
+            uint256 timeSinceCliffEnd = timeSinceTGE - (cliffWeeks * WEEK_IN_SECONDS);
+            uint256 weeksSinceCliffEnd = timeSinceCliffEnd / WEEK_IN_SECONDS;
+            
+            // Team has no TGE release, only weekly releases after cliff
+            vestedAmount = 0;
+            
+            if (weeksSinceCliffEnd > 0 && schedule.weeklyPercent > 0) {
+                uint256 weeksToCalculate = weeksSinceCliffEnd > schedule.vestingWeeks ? schedule.vestingWeeks : weeksSinceCliffEnd;
+                uint256 weeklyAmount = (totalCategoryTokens * schedule.weeklyPercent) / FEE_DENOMINATOR;
+                vestedAmount = weeklyAmount * weeksToCalculate;
+            }
+        } else {
+            // Standard vesting logic for non-team categories
+            // TGE release
+            uint256 tgeAmount = (totalCategoryTokens * schedule.tgePercent) / FEE_DENOMINATOR;
+            vestedAmount = tgeAmount;
 
-        // TGE release
-        uint256 tgeAmount = (totalCategoryTokens * schedule.tgePercent) / FEE_DENOMINATOR;
-        vestedAmount = tgeAmount;
-
-        // Weekly releases - use full timeSinceTGE (including cliff period for team)
-        uint256 weeksPassed = timeSinceTGE / WEEK_IN_SECONDS;
-        if (weeksPassed > 0 && schedule.weeklyPercent > 0) {
-            uint256 weeksToCalculate = weeksPassed > schedule.vestingWeeks ? schedule.vestingWeeks : weeksPassed;
-            uint256 weeklyAmount = (totalCategoryTokens * schedule.weeklyPercent) / FEE_DENOMINATOR;
-            vestedAmount += weeklyAmount * weeksToCalculate;
+            uint256 weeksPassed = timeSinceTGE / WEEK_IN_SECONDS;
+            if (weeksPassed > 0 && schedule.weeklyPercent > 0) {
+                uint256 weeksToCalculate = weeksPassed > schedule.vestingWeeks ? schedule.vestingWeeks : weeksPassed;
+                uint256 weeklyAmount = (totalCategoryTokens * schedule.weeklyPercent) / FEE_DENOMINATOR;
+                vestedAmount += weeklyAmount * weeksToCalculate;
+            }
         }
         
-        // Cap at total allocation
-        if (vestedAmount > totalCategoryTokens) {
-            vestedAmount = totalCategoryTokens;
+        if (vestedAmount > remainingCategoryTokens) {
+            vestedAmount = remainingCategoryTokens;
         }
         
         return vestedAmount;
     }
-    
-    /**
-     * @dev View function to check how many tokens are available to release for a category
-     * @param category The vesting category to check
-     * @return availableAmount Tokens ready to be released
-     */
     function getAvailableToRelease(VestingCategory category) external view returns (uint256 availableAmount) {
         VestingSchedule memory schedule = vestingSchedules[category];
         uint256 vestedAmount = calculateVested(category);
@@ -671,17 +495,59 @@ contract LAVA is Context, IERC20, Ownable {
         return availableAmount;
     }
 
-    // Set individual vesting wallets
+
     function setVestingWallet(VestingCategory category, address wallet) external onlyOwner {
         require(wallet != address(0), "wallet 0");
         vestingSchedules[category].wallet = wallet;
-        
-        // Update individual wallet variables for backward compatibility
-        if (category == VestingCategory.PrivateSale) privateSaleWallet = wallet;
-        else if (category == VestingCategory.PublicSale) publicSaleWallet = wallet;
-        else if (category == VestingCategory.CommunityRewards) communityRewardsWallet = wallet;
-        else if (category == VestingCategory.Advisors) advisorWallet = wallet;
-        else if (category == VestingCategory.CexListing) cexListingWallet = wallet;
-        else if (category == VestingCategory.Team) teamWallet = wallet;
+    }
+
+    function maxTotalSupply() public pure returns (uint256) {
+        return _totalSupply;
+    }
+
+    function remainingSupply() public view returns (uint256) {
+        return _totalSupply - totalMinted;
+    }
+
+    function getMintedByCategory(VestingCategory category) public view returns (uint256) {
+        return mintedByCategory[category];
+    }
+
+    function getRemainingCategoryAllocation(VestingCategory category) public view returns (uint256) {
+        VestingSchedule memory schedule = vestingSchedules[category];
+        uint256 totalCategoryTokens = (_totalSupply * schedule.totalShare) / FEE_DENOMINATOR;
+        return totalCategoryTokens - mintedByCategory[category];
+    }
+    
+    // View functions for treasury and fee information
+    function getCollectedFees() external view returns (uint256) {
+        return collectedFees;
+    }
+    
+    function getContractTokenBalance() external view returns (uint256) {
+        return _balances[address(this)];
+    }
+    
+    // Getter functions for vesting wallet addresses
+    function privateSaleWallet() external view returns (address) {
+        return vestingSchedules[VestingCategory.PrivateSale].wallet;
+    }
+    
+    // publicSaleWallet is already a public state variable, no need for getter
+    
+    function communityRewardsWallet() external view returns (address) {
+        return vestingSchedules[VestingCategory.CommunityRewards].wallet;
+    }
+    
+    function cexListingWallet() external view returns (address) {
+        return vestingSchedules[VestingCategory.CexListing].wallet;
+    }
+    
+    function advisorWallet() external view returns (address) {
+        return vestingSchedules[VestingCategory.Advisors].wallet;
+    }
+    
+    function teamWallet() external view returns (address) {
+        return vestingSchedules[VestingCategory.Team].wallet;
     }
 }
