@@ -63,7 +63,7 @@ The 50M LAVA tokens are distributed as follows:
 
 ### Key Vesting Timeline
 
-- **Week 0 (TGE):** Private Sale (25%), Public Sale (35%), Advisors (25%) receive initial releases
+- **Week 0 (TGE):** Private Sale (25%), Public Sale (30%), Advisors (25%) receive initial releases
 - **Weeks 1-3:** Private Sale, Public Sale, Advisors continue weekly releases
 - **Month 1-12:** Community Rewards receive monthly releases
 - **Quarters 1-4:** CEX Listing receives quarterly releases
