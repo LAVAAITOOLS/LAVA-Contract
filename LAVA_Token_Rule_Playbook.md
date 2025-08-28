@@ -79,7 +79,7 @@ The 50M LAVA tokens are distributed as follows:
 
 1. Deploy contract with proper constructor arguments; verify the source on Basescan.
 2. **Set all vesting wallet addresses** using `setVestingWallets()` function.
-3. Provide liquidity to the selected AMM pair (3% of supply is immediately available).
+3. Provide liquidity to the selected AMM pair (6% of supply is immediately available).
 4. Set the AMM pair address using `setAutomatedMarketMakerPair()`.
 5. Optionally adjust fee split via `setFeeShares()` (total rates remain fixed).
 6. Enable trading via `enableTrading()` once liquidity is secured and pair is set.
