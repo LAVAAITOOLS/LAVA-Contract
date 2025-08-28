@@ -67,7 +67,7 @@ The 50M LAVA tokens are distributed as follows:
 - **Weeks 1-3:** Private Sale, Public Sale, Advisors continue weekly releases
 - **Month 1-12:** Community Rewards receive monthly releases
 - **Quarters 1-4:** CEX Listing receives quarterly releases
-- **Month 6-15:** Team receives monthly releases (after 3-month cliff)
+- **Month 4-14:** Team receives monthly releases (after 3-month cliff)
 
 ## Fee handling & transparency
 
